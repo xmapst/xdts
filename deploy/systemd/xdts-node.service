@@ -1,0 +1,24 @@
+[Unit]
+Description=xdts Node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=xdts-node
+Group=xdts-node
+WorkingDirectory=/etc/xdts
+EnvironmentFile=-/etc/xdts/node.env
+ExecStart=/usr/local/lib/xdts/xdts-node --config /etc/xdts/node.yaml
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/xdts-node /var/log/xdts
+
+[Install]
+WantedBy=multi-user.target

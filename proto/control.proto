@@ -1,0 +1,719 @@
+syntax = "proto3";
+
+package xdts.v1;
+
+import "common.proto";
+import "config.proto";
+import "data.proto";
+
+option go_package = "github.com/xmapst/xdts/internal/iproto;iproto";
+
+// 控制面包括注册、身份确认、配置拉取与通知、指令和探测请求/应答。
+
+// ===== 注册（MGR-NODE-01~03，NODE-BOOT-01~04） =====
+
+// RegisterRequest 是节点首次注册的请求。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message RegisterRequest {
+  string register_code = 1;
+  // 客户端生成的幂等键（建议 UUID）：一次注册尝试开始前生成一次，在发出第一条
+  // RegisterRequest 之前就必须持久化到节点本地（register_code 可以直接作为
+  // identity.xdoc 的加密口令，此时已经可以打开，见 NODE-XDOC-03），此后针对
+  // 同一次注册尝试的所有请求（含跨越进程重启的重试）复用这个持久化值，直到
+  // 收到成功的 RegisterReply 并已把 node_id/node_token 落盘为止。同一
+  // instance_id 的重复请求必须返回同一结果（NODE-BOOT-04：跨中心 RPC 需考虑
+  // 联邦绑定传播延迟导致的超时重试）。
+  //
+  // 不持久化、每次进程重启都重新生成的后果：一次"Manager 已处理成功但回复
+  // 丢失，或节点在落盘 node_token 之前崩溃"会让重启后的重试携带不同的
+  // instance_id，无法被 Manager 识别为同一次尝试，直接撞上 register_code 的
+  // max_uses=1 耗尽——这不是幂等机制本身失败，是这个字段没有按预期生命周期
+  // 使用，后果是这个节点永久无法用这个注册码完成注册。
+  //
+  // 不要与 internal/transport 的 RPCClient instanceID（回复队列 xdts.reply.
+  // <instanceId> 的一部分，按 RPCClient 的生命周期而非按注册尝试生成）或
+  // AMQP correlation_id（按单次物理 RPC 调用生成，见 internal/transport/rpc.go
+  // 顶部文档第 2 点）混淆——三者名字相近、层次不同，生命周期也不同。
+  string instance_id = 2;
+  string hostname = 3;
+  repeated string ips = 4;
+  string os_arch = 5;
+  string node_version = 6;
+  uint32 protocol_version = 7;
+}
+
+// RegisterReply 里 node_token 明文只在这一次回复中出现，节点落盘于 identity.xdoc，
+// 此后不再重复下发（NODE-BOOT-02）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message RegisterReply {
+  // 非空表示失败（注册码无效/过期/已被使用等，MGR-NODE-01 一码一节点）。
+  Error error = 1;
+  string node_id = 2;
+  string node_token = 3;
+  string center_code = 4;
+  // ed25519 公钥（MQ-11，P1），当前阶段可能为空。
+  bytes manager_pub_key = 5;
+  uint32 protocol_version = 6;
+}
+
+// ===== 身份确认与协议版本校验（NODE-BOOT-05） =====
+
+// NodeHello 在每次控制面连接建立/重连后发送，用于身份确认与协议版本校验。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message NodeHello {
+  string node_id = 1;
+  uint32 protocol_version = 2;
+  string node_version = 3;
+  repeated string ips = 4;
+  // Explicit optional feature support; absent capabilities never imply support.
+  repeated string capabilities = 5;
+}
+
+// NodeHelloReply 中 error 非空（通常 code="PROTOCOL_INCOMPATIBLE"）时，节点必须拒绝工作
+// 并上报（NODE-BOOT-05），不得降级继续运行。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message NodeHelloReply {
+  Error error = 1;
+  uint32 protocol_version = 2;
+  string center_code = 3;
+}
+
+// ===== 配置拉取与热更新（NODE-CFG-01~05） =====
+
+// PipelineConfigItem 是 ConfigPullReply 中一条 pipeline 的配置负载，source/target 按
+// role 二选一填充——一条 item 只承载一个角色的投影。
+//
+// 同一节点同时担任某条 pipeline 的源端与目标端（自环拓扑）是合法的，而且会发生：
+// 需求硬约束 C-02「同步数据（全量与增量）必须经 AMQP 传输，源端与目标端在同一节点
+// 时也不例外」与验收项 AC-MQ-01 都以该拓扑存在为前提——C-02 不是允许它，是因它而
+// 存在（"同机时也不许抄近路绕过 AMQP"这句话只有在同机会发生时才有意义）。
+//
+// 因此该节点的一次 ConfigPullReply 里会出现两条 pipeline_id 相同、role 不同的 item。
+// 消费方必须按 (pipeline_id, role) 而不是 pipeline_id 单键来区分它们；产出方
+// internal/manager/dispatch/ctl_config_pull.go 的 onConfigPullReq 正是这么做的
+// （按 SourceNodeID/TargetNodeID 分别判断要不要追加，不是互斥的 if/else）。
+//
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PipelineConfigItem {
+  string pipeline_id = 1;
+  uint64 config_version = 2;
+  PipelineRole role = 3;
+  CommonConfig common = 4;
+  // role=PIPELINE_ROLE_SOURCE 时填充。
+  SourceSideConfig source = 5;
+  // role=PIPELINE_ROLE_TARGET 时填充。
+  TargetSideConfig target = 6;
+  // true 表示该 pipeline 已不再由本节点承载，节点应卸载对应模块
+  // （NODE-CFG-02"删除 → 卸载模块"分支）。
+  bool deleted = 7;
+  // Cleanup is staged: a target may finish queued work only after the source
+  // has acknowledged the deletion revision and can no longer publish data.
+  bool cleanup_source_stopped = 8;
+  // A stopped role moved to another node. Unload local ownership durably;
+  // shared data/snapshot queues belong to the new owner and must be retained.
+  bool ownership_released = 9;
+}
+
+// ConfigPullRequest：pipeline_ids 为空表示拉取该节点承载的全部 pipeline 配置
+// （NODE-CFG-01 启动/重连后的全量拉取）；非空表示按 pipeline 增量拉取
+// （收到 ConfigChanged 后的定向拉取）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ConfigPullRequest {
+  string node_id = 1;
+  repeated string pipeline_ids = 2;
+}
+
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ConfigPullReply {
+  Error error = 1;
+  repeated PipelineConfigItem configs = 2;
+}
+
+// SourceCheckpoint is a published source position, never a read position.
+// An empty published_gtid_set is a known empty set because the message has presence.
+message SourceCheckpoint {
+  string pipeline_id = 1;
+  string node_id = 2;
+  uint64 run_id = 3;
+  uint64 position_revision = 4;
+  uint64 epoch = 5;
+  uint64 batch_seq = 6;
+  string published_gtid_set = 7;
+  int64 observed_ts_ms = 8;
+}
+
+// The authenticated source requests recovery and a durable epoch range.
+// Local state remains authoritative while present. Manager records the reserved
+// ceiling so recovery after losing local state cannot reuse an offline epoch.
+message SourceRecoveryRequest {
+  string pipeline_id = 1;
+  string node_id = 2;
+  uint64 run_id = 3;
+  uint64 position_revision = 4;
+  uint64 known_epoch_ceiling = 5;
+  SourceCheckpoint local_checkpoint = 6;
+  // A source-resolved initial position; absent differs from a known empty set.
+  optional string initial_gtid_set = 7;
+  // Stable UUID per range request; a crash can safely request a fresh range.
+  string request_id = 8;
+  uint64 config_version = 9;
+}
+
+message SourceRecoveryReply {
+  Error error = 1;
+  SourceCheckpoint checkpoint = 2;
+  uint64 epoch_floor = 3;
+  uint64 epoch_ceiling = 4;
+  string request_id = 5;
+}
+
+// Signed Manager request to the old, stopped role owner. No selectors supplied
+// by the caller: the owner chooses its fixed collection and run scope.
+message PipelineStateExportRequest {
+  string pipeline_id = 1;
+  uint64 run_id = 2;
+  PipelineRole role = 3;
+  string snapshot_uuid = 4;
+  uint64 config_version = 5;
+  string destination_node_id = 6;
+  string request_id = 7;
+}
+
+message PipelineStateExportReply {
+  Error error = 1;
+  PipelineStateBundle bundle = 2;
+  string request_id = 3;
+}
+
+// ConfigChanged 是 Manager 主动下发的变更通知，只带 pipeline_id 与版本
+// ，节点收到后发起定向 ConfigPullRequest 拉取完整内容。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ConfigChanged {
+  string pipeline_id = 1;
+  uint64 config_version = 2;
+  bool deleted = 3;
+}
+
+// PipelineChangeKind 对应 internal/node/controller/diff.go 的 changeKind
+// （NODE-CFG-02，"热更 / 重建判定表"）：节点收到一条 pipeline 配置后，
+// 实际执行的动作分类。五个真实取值，不是四个——changeNone 同样是一个真实、
+// 需要能被回执表达的结果：config_version 变了但本角色投影没有可观察差异，节点
+// 不触碰任何模块，仍然要回执"应用成功"；如果枚举漏掉这个值，节点没有诚实的
+// 方式表达"确认收到、确认无需动作"，会被迫要么谎称某个动作发生过，要么复用
+// UNSPECIFIED（UNSPECIFIED 的含义是"节点未填充"，不是"确认了但没有动作"，
+// 两者必须能区分，否则回执就没法诚实回答"到底有没有收到并处理这次变更"）。
+//
+// UNSPECIFIED=0 表示节点未按本字段的语义填充；消费方不应把它当作任何一种具体
+// 路径，只能理解成"这次回执不携带路径信息"。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum PipelineChangeKind {
+  PIPELINE_CHANGE_KIND_UNSPECIFIED = 0;
+  // 对应 changeNone：config_version 变化未触及本角色投影任何字段，未触碰模块。
+  PIPELINE_CHANGE_KIND_NONE = 1;
+  PIPELINE_CHANGE_KIND_LOAD = 2;
+  // 对应 changeHotUpdate：命中"热更新"判定桶，原地生效，未重建模块。
+  PIPELINE_CHANGE_KIND_HOT_UPDATE = 3;
+  // 对应 changeRebuild：命中"重建"判定桶（含 role 本身改变），先卸载旧模块
+  // 再按新配置加载。
+  PIPELINE_CHANGE_KIND_REBUILD = 4;
+  // 对应 changeUnload：该 pipeline 不再由本节点承载，卸载已加载的模块。
+  PIPELINE_CHANGE_KIND_UNLOAD = 5;
+}
+
+// ConfigApplyResult 是节点应用配置后的回执（NODE-CFG-03）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ConfigApplyResult {
+  string pipeline_id = 1;
+  uint64 config_version = 2;
+  PipelineRole role = 3;
+  bool success = 4;
+  // success=false 时填充（如 NODE-CFG-05 拒绝版本倒退、签名校验失败）。
+  Error error = 5;
+  PipelineChangeKind change_kind = 6;
+}
+
+// ===== pipeline 指令与节点指令（需求 MGR-PL-04/MGR-NODE-06/07） =====
+
+// PipelineCmdType 定义全部 pipeline 指令。START/STOP/PAUSE/RESUME/
+// RESTART 表达的是彼此独立的用户/Manager 意图，协议不承诺、也不要求节点侧用不同的物理
+// 动作实现它们——当前选定的实现路线下 STOP 与 PAUSE 收敛为同一动作、START 与 RESUME 收敛
+// 为同一动作，RESTART 收敛为前两者的原子组合，这是该路线的
+// 结果，不是这些值的语义组成部分，实现路线变化时这条注释不需要跟着改。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum PipelineCmdType {
+  PIPELINE_CMD_TYPE_UNSPECIFIED = 0;
+  PIPELINE_CMD_TYPE_START = 1;
+  PIPELINE_CMD_TYPE_STOP = 2;
+  PIPELINE_CMD_TYPE_PAUSE = 3;
+  PIPELINE_CMD_TYPE_RESUME = 4;
+  PIPELINE_CMD_TYPE_RESTART = 5;
+  PIPELINE_CMD_TYPE_SET_POSITION = 6;
+  PIPELINE_CMD_TYPE_REINIT = 7;
+  PIPELINE_CMD_TYPE_SKIP_ERROR = 8;
+  PIPELINE_CMD_TYPE_DELETE_QUEUE = 9;
+}
+
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SetPositionArgs {
+  StartPosition position = 1;
+}
+
+// ReinitArgs 携带 Manager 预先分配好的新 run_id 与两个合成 UUID（需求 MGR-PL-09：
+// 重新初始化生成新的 run_id 与新的合成 UUID）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ReinitArgs {
+  uint64 new_run_id = 1;
+  string snapshot_uuid = 2;
+  // 未开启结构迁移时为空。
+  string schema_uuid = 3;
+  string digest = 4;
+  // Independent target preparation identity; empty for KEEP.
+  string prepare_uuid = 5;
+}
+
+// SkipErrorArgs.reason 必须非空：Manager 侧要求"跳过"须显式操作并审计（NODE-MQI-04）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SkipErrorArgs {
+  string reason = 1;
+}
+
+// cmd_seq 由 Manager 单调分配；节点据此去重并拒绝过期指令。
+message PipelineCmd {
+  string pipeline_id = 1;
+  uint64 config_version = 2;
+  uint64 cmd_seq = 3;
+  PipelineCmdType type = 4;
+  // type=PIPELINE_CMD_TYPE_SET_POSITION 时填充。
+  SetPositionArgs set_position = 5;
+  // type=PIPELINE_CMD_TYPE_REINIT 时填充。
+  ReinitArgs reinit = 6;
+  // type=PIPELINE_CMD_TYPE_SKIP_ERROR 时填充。
+  SkipErrorArgs skip_error = 7;
+}
+
+// NodeCmdType 覆盖需求 MGR-NODE-06/07 的节点级指令。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum NodeCmdType {
+  NODE_CMD_TYPE_UNSPECIFIED = 0;
+  NODE_CMD_TYPE_SET_LOG_LEVEL = 1;
+  NODE_CMD_TYPE_SET_REPORT_LOG_LEVEL = 2;
+  NODE_CMD_TYPE_REVOKE = 3;
+}
+
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message NodeCmd {
+  string node_id = 1;
+  uint64 cmd_seq = 2;
+  NodeCmdType type = 3;
+  // type=SET_LOG_LEVEL/SET_REPORT_LOG_LEVEL 时填充：DEBUG/INFO/WARN/ERROR。
+  string log_level = 4;
+}
+
+// 自环拓扑下同一个节点身兼源/目标两侧，一条 cmd.pipeline 要在两侧都执行，而 AMQP
+// 那条投递只能 ack 一次、cmd_seq 也只能回一条 cmd.result（node/controller 的 cmdFanout）。
+// 于是各侧的执行结果在构造回执之前就被聚合掉了，侧别归属只剩 Error.message 里的文本。
+// 本消息是那份明细的协议形态，逐字段对应节点侧已有的 cmdSideOutcome{role, state, err}。
+//
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PipelineSideResult {
+  // 哪一侧。PIPELINE_ROLE_UNSPECIFIED 不是合法取值：本消息存在的全部理由就是点名侧别，
+  // 填不出侧别时不要产出本消息（让 sides 保持为空，等同于"没说"）。
+  PipelineRole role = 1;
+  // 这一侧执行后的实际状态。与 PipelineCmdResult.resulting_state 的区别是那一个是
+  // **聚合值**（两侧不一致时为 UNSPECIFIED），这一个是这一侧的真实状态。
+  PipelineState resulting_state = 2;
+  // 这一侧的失败原因；该侧成功时留空。与顶层 CmdResult.error 的区别同上：那一条是
+  // 各侧错误合并后的文本，这一条是这一侧自己的。
+  Error error = 3;
+}
+
+// PipelineCmdResult 确认流水线指令身份、执行后状态和各侧执行结果。
+message PipelineCmdResult {
+  string pipeline_id = 1;
+  // 各侧状态相同则取该值，否则为 UNSPECIFIED；此字段只用于诊断。
+  PipelineState resulting_state = 2;
+  // 原样返回触发执行的命令类型，不推断默认类型。
+  PipelineCmdType cmd_type = 3;
+  // 所有参与执行的侧都必须出现，成功侧 error 为空，同一 role 最多一次。
+  // 指令在派发前失败时为空，不编造侧归属。
+  repeated PipelineSideResult sides = 4;
+  // 触发本回执的准确配置版本，零是有效版本。
+  uint64 config_version = 5;
+  // 未分类时缺席；显式 false 才允许终止当前意图的自动恢复。
+  optional bool retryable = 6;
+}
+
+message NodeCmdResult {
+  string node_id = 1;
+}
+
+// CmdResult 用 oneof 区分流水线和节点指令结果，统一使用 cmd.result 消息类型。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message CmdResult {
+  uint64 cmd_seq = 1;
+  bool success = 2;
+  Error error = 3;
+  oneof target {
+    PipelineCmdResult pipeline = 4;
+    NodeCmdResult node = 5;
+  }
+}
+
+// ===== 探测 =====
+
+// ProbeType 定义全部探测类型。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum ProbeType {
+  PROBE_TYPE_UNSPECIFIED = 0;
+  PROBE_TYPE_CONN_TEST = 1;
+  PROBE_TYPE_PARAMS = 2;
+  PROBE_TYPE_CATALOG = 3;
+  PROBE_TYPE_DEFS = 4;
+  PROBE_TYPE_POSITION = 5;
+  PROBE_TYPE_PRECHECK = 6;
+  PROBE_TYPE_LINK = 7;
+  PROBE_TYPE_BROKER = 8;
+  PROBE_TYPE_DATA_CHECK = 9;
+}
+
+// PositionProbeArgs 是 type=PROBE_TYPE_POSITION 时的探测参数，包含三种
+// 换算输入（GTID 集合本身不需要换算，此处只列需要换算的两种 + kind 判别）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PositionProbeArgs {
+  InitPositionKind kind = 1;
+  string gtid_set = 2;
+  string binlog_file = 3;
+  uint64 binlog_offset = 4;
+  int64 ts_ms = 5;
+  // 仅用于一次性复制协议探测；Manager 保证源侧未运行时才复用分配号。
+  uint32 binlog_server_id = 6;
+  uint64 checkpoint_run_id = 7;
+  uint64 position_revision = 8;
+  bool include_checkpoint = 9;
+  string checkpoint_pipeline_id = 10;
+}
+
+// ManagementAPIConn 是中心 RabbitMQ Management API 的地址与凭据（MGR-CTR-03），只下发给
+// 被指派为巡检节点的那个节点，随 PROBE_TYPE_BROKER 的探测请求一起下发，不进入
+// CommonConfig/TargetSideConfig 等常规配置（避免非巡检节点也拿到 Broker 管理凭据）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ManagementAPIConn {
+  string url = 1;
+  string username = 2;
+  string password = 3;
+}
+
+// ProbeRequest 是 Manager 向节点派发的探测任务。task_id 由 Manager
+// 分配，节点回执必须带同一 task_id 以保证幂等与去重；同一任务可重试。
+message ProbeRequest {
+  string task_id = 1;
+  ProbeType type = 2;
+  // PRECHECK/LINK 使用：定位到具体 pipeline 与探测哪一侧。
+  string pipeline_id = 3;
+  PipelineRole side = 4;
+  // CONN_TEST/PARAMS/CATALOG/DEFS/POSITION 使用。
+  EndpointConn endpoint = 5;
+  // type=PROBE_TYPE_POSITION 时的额外参数。
+  PositionProbeArgs position = 6;
+  // type=PROBE_TYPE_BROKER 使用。
+  string center_code = 7;
+  ManagementAPIConn broker_mgmt = 8;
+  bytes extra_params_json = 9;
+  // DEFS uses an explicit database scope; an empty scope is rejected.
+  DefsProbeArgs defs = 10;
+  // PRECHECK uses an exact, Manager-selected business table scope.
+  PrecheckProbeArgs precheck = 11;
+  LinkProbeArgs link = 12;
+  DataCheckProbeArgs data_check = 13;
+}
+
+message DataCheckProbeArgs {
+  string schema = 1;
+  string table = 2;
+  repeated string columns = 3;
+  uint64 sample_modulo = 4;
+}
+
+message DataCheckDigest {
+  bytes result_json = 1;
+}
+
+enum LinkProbePhase {
+  LINK_PROBE_PHASE_UNSPECIFIED = 0;
+  LINK_PROBE_PHASE_PREPARE = 1;
+  LINK_PROBE_PHASE_RECEIVE = 2;
+  LINK_PROBE_PHASE_SEND = 3;
+}
+
+// A stopped-pipeline probe uses a one-time key; never log this request.
+message LinkProbeArgs {
+  LinkProbePhase phase = 1;
+  string probe_id = 2;
+  uint64 run_id = 3;
+  uint64 config_version = 4;
+  bytes sign_key = 5;
+  int64 expires_at_ms = 6;
+  bool snapshot = 7;
+  string source_node_id = 8;
+  string source_center = 9;
+  // Explicit capability: validate the actual route with an expiring auxiliary
+  // binding while keeping stopped-run business deliveries untouched.
+  bool preserve_backlog_v1 = 10;
+}
+
+message PrecheckTable {
+  string schema = 1;
+  string table = 2;
+  // Empty means this table does not use LWW.
+  string lww_timestamp_column = 3;
+}
+
+message PrecheckProbeArgs {
+  repeated PrecheckTable tables = 1;
+  bool snapshot = 2;
+  bool schema_migration = 3;
+  bool sync_ddl = 4;
+  bool drop_recreate = 5;
+  // Source-only parameters. Converted positions use GTID_SET.
+  uint32 binlog_server_id = 6;
+  InitPositionKind start_kind = 7;
+  string start_gtid_set = 8;
+  // Target-only: the newly allocated snapshot identity, never an old run ID.
+  string snapshot_uuid = 9;
+  uint64 estimated_snapshot_seconds = 10;
+  bool keyless_incremental_warning = 11;
+  // Only used when a reviewed migration plan will create missing target tables.
+  bool allow_missing_target_tables = 12;
+  bool creates_functions = 13;
+  // Keep the LWW precision check present even if selected tables use fallback.
+  bool check_lww = 14;
+  uint64 snapshot_rows_per_second = 15;
+  uint64 snapshot_bytes_per_second = 16;
+  // Source only: independently validate the registered read-only snapshot replica.
+  EndpointConn snapshot_replica = 17;
+  // Requires reserved metadata provisioning and explicit read/append grants.
+  bool persistent_lineage_v1 = 18;
+  // Target only, explicitly negotiated stopped-run resume. Existing synthetic
+  // GTIDs must stay within the original saved plan's chunk range.
+  uint64 snapshot_resume_chunk_limit_v1 = 19;
+}
+
+message DefsProbeArgs {
+  repeated string schemas = 1;
+  // Target-side preview may inspect databases that have not been created yet.
+  bool allow_missing_schemas = 2;
+  // Only these exact accounts are inspected; never enumerate mysql.user.
+  repeated DefinerAccount accounts = 3;
+}
+
+message DefinerAccount {
+  string user = 1;
+  string host = 2;
+}
+
+message DefinerAccountResult {
+  DefinerAccount account = 1;
+  // false means the node could not prove either presence or absence.
+  bool verified = 2;
+  bool exists = 3;
+  bool grants_verified = 4;
+  // Selected schemas where direct grants prove EXECUTE privileges.
+  repeated string execute_schemas = 5;
+}
+
+// ConnTestResult 对应 conn_test 的输出：连通性、版本、server_uuid、关键参数。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ConnTestResult {
+  bool ok = 1;
+  string version = 2;
+  string server_uuid = 3;
+  // 关键参数（如 gtid_mode、log_bin、binlog_format），键为参数名。
+  map<string, string> key_params = 4;
+  // SHOW GRANTS 的原始结果，供管理界面展示。
+  repeated string grants = 5;
+}
+
+// ParamsResult 对应 params 的输出：GTID/binlog 参数、权限、binlog 保留情况。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ParamsResult {
+  // gtid_mode / enforce_gtid_consistency / binlog_format / binlog_row_image /
+  // binlog_row_metadata / server_id 等。
+  map<string, string> gtid_binlog_params = 1;
+  // SHOW GRANTS 展开后的权限清单。
+  repeated string granted_privileges = 2;
+  string binlog_retention_hint = 3;
+}
+
+// CatalogTable 是 catalog 输出中的一张表（库表清单、估算行数、主键/唯一键）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message CatalogTable {
+  string schema = 1;
+  string table = 2;
+  int64 estimated_rows = 3;
+  repeated string primary_key_columns = 4;
+  repeated UniqueKeyColumns unique_keys = 5;
+  // TABLE_ROWS 为 NULL 时 false；estimated_rows=0 本身是有效估算值。
+  bool estimated_rows_known = 6;
+}
+
+message CatalogResult {
+  repeated CatalogTable tables = 1;
+}
+
+// DefsEntry/DefsResult 对应 defs 输出：SHOW CREATE ... 定义文本。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message DefsEntry {
+  string schema = 1;
+  string object_name = 2;
+  SchemaObjectKind kind = 3;
+  string definition = 4;
+  // Actual ordered view output names used for migration placeholders.
+  repeated string view_columns = 5;
+  // Actual information_schema.TABLES.TABLE_COLLATION; definition remains raw.
+  string table_collation_v1 = 6;
+}
+
+message DefsResult {
+  repeated DefsEntry entries = 1;
+  // Actual executing account and environment used by migration prechecks.
+  string current_user = 2;
+  map<string, string> key_params = 3;
+  repeated string grants = 4;
+  repeated DefinerAccountResult accounts = 5;
+  // Actual target capabilities from information_schema, never a version guess.
+  repeated string character_sets = 6;
+  repeated string collations = 7;
+}
+
+// PositionResult 对应 position 输出：位点换算与校验结果。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PositionResult {
+  string gtid_set = 1;
+  string binlog_file = 2;
+  uint64 binlog_offset = 3;
+  int64 txn_commit_ts_ms = 4;
+  // 非阻断提示，如"指定集合包含源库未执行过的 GTID"（NODE-POS-02）。
+  repeated string warnings = 5;
+  optional string published_gtid_set = 6;
+  uint64 checkpoint_epoch = 7;
+  uint64 checkpoint_position_revision = 8;
+  // Present only for a rejected offset; zero following means unknown.
+  PositionBoundary boundary = 9;
+}
+
+// PrecheckSeverity 标识预检查级别：阻断项不通过禁止启动，警告项需人工确认。
+enum PrecheckSeverity {
+  PRECHECK_SEVERITY_UNSPECIFIED = 0;
+  PRECHECK_SEVERITY_INFO = 1;
+  PRECHECK_SEVERITY_WARNING = 2;
+  PRECHECK_SEVERITY_BLOCKING = 3;
+}
+
+// PrecheckItem 的 detail_json 是结构化细节的弹性出口（如缺失的具体权限名、无主键的具体
+// 表清单），预检查项种类繁多且随探测类型变化，core 字段（code/severity/message）
+// 加上 passed 后供 Manager 分别判定检查结果与阻断/警告，细节暂不逐项强类型化。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PrecheckItem {
+  // 预检查项编号/键，如 "binlog_row_image_full"、"no_primary_key_tables"。
+  string code = 1;
+  PrecheckSeverity severity = 2;
+  string message = 3;
+  bytes detail_json = 4;
+  // Severity and execution success do not imply that a check passed.
+  bool passed = 5;
+}
+
+message PrecheckResult {
+  repeated PrecheckItem items = 1;
+  // Actual local database metadata for Manager comparison checks.
+  string version = 2;
+  string server_uuid = 3;
+  map<string, string> key_params = 4;
+  int64 node_time_ms = 5;
+  // Actual local SHOW CREATE TABLE output, used for Manager definition checks.
+  repeated DefsEntry table_definitions = 6;
+  SnapshotCapacityEstimate capacity = 7;
+}
+
+message SnapshotCapacityEstimate {
+  bool verified = 1;
+  uint64 estimated_seconds = 2;
+  uint64 estimated_snapshot_bytes = 3;
+  uint64 binlog_growth_bytes = 4;
+  uint64 binlog_sample_ms = 5;
+  uint64 sampled_rows = 6;
+  uint64 sampled_bytes = 7;
+  uint64 estimated_rows = 8;
+  string unavailable_reason = 9;
+}
+
+// LinkResult 对应 link 输出：端到端链路探测回执（NODE-MQO-05）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message LinkResult {
+  bool ok = 1;
+  string detail = 2;
+  int64 rtt_ms = 3;
+  string probe_id = 4;
+  uint64 run_id = 5;
+  uint64 config_version = 6;
+  bool snapshot = 7;
+  bool preserve_backlog_v1 = 8;
+}
+
+// BrokerBacklog/BrokerResult 对应 broker 输出：联邦链路、上游积压、磁盘余量。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message BrokerBacklog {
+  string queue = 1;
+  int64 messages = 2;
+  int64 messages_ready = 3;
+  int64 messages_unacked = 4;
+  int64 message_bytes = 5;
+}
+
+message BrokerResult {
+  bool federation_ok = 1;
+  repeated BrokerBacklog backlogs = 2;
+  int64 disk_free_bytes = 3;
+  repeated string warnings = 4;
+  repeated BrokerDiskCapacity nodes = 5;
+  uint64 queue_bytes = 6;
+  bool capacity_verified = 7;
+  // Complete Management API observations of xdts.pl.* business queues.
+  repeated BrokerBacklog data_queues = 8;
+  bool data_queues_verified = 9;
+}
+
+message BrokerDiskCapacity {
+  string node = 1;
+  uint64 disk_free_bytes = 2;
+  uint64 disk_free_limit_bytes = 3;
+  bool disk_free_alarm = 4;
+}
+
+// ProbeResult 按 type 用 oneof 携带对应的强类型结果；Manager 侧据此落库
+// （endpoints.last_probe_result 等）并驱动界面展示"数据新鲜度"。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ProbeResult {
+  string task_id = 1;
+  ProbeType type = 2;
+  bool success = 3;
+  Error error = 4;
+  oneof result {
+    ConnTestResult conn_test = 5;
+    ParamsResult params = 6;
+    CatalogResult catalog = 7;
+    DefsResult defs = 8;
+    PositionResult position = 9;
+    PrecheckResult precheck = 10;
+    LinkResult link = 11;
+    BrokerResult broker = 12;
+    DataCheckDigest data_check = 13;
+  }
+}
+
+message PositionBoundary {
+  string file = 1;
+  uint64 requested = 2;
+  uint64 preceding = 3;
+  optional uint64 following = 4;
+}

@@ -1,0 +1,8 @@
+# dist/ 是 web/ 执行 `vite build` 的输出目录（设计 §12.4），属于生成物，不进
+# Git。唯一例外是 dist/index.html：保留一个占位版本，使
+# internal/manager/static 里的 `//go:embed dist` 在前端还没构建时也能编译。
+#
+# 真正跑过一次前端构建后，本地这个文件会被 vite 的真实产物覆盖；不要把覆盖
+# 后的内容提交。
+dist/*
+!dist/index.html

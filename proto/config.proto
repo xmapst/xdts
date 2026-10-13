@@ -1,0 +1,615 @@
+syntax = "proto3";
+
+package xdts.v1;
+
+import "common.proto";
+
+option go_package = "github.com/xmapst/xdts/internal/iproto;iproto";
+
+// Manager 按角色投影 PipelineConfigItem：源端仅接收源库凭据，目标端仅接收目标库凭据。
+// CommonConfig 为两端公共配置；规则和策略按执行位置分组。
+
+// TLSConfig 对应 endpoints 表的 tls(JSON) 列。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message TLSConfig {
+  bool enabled = 1;
+  bool skip_verify = 2;
+  bytes ca_cert = 3;
+  bytes client_cert = 4;
+  bytes client_key = 5;
+}
+
+// 名称比较取决于端点 lower_case_table_names；配置和实际执行必须使用同一比较策略。
+enum LowerCaseTableNames {
+  LOWER_CASE_TABLE_NAMES_UNSPECIFIED = 0;
+  // MySQL 值 0：表名在磁盘上原样存储，比较大小写敏感——Linux 默认值，也是三个取值里
+  // 唯一需要切换成大小写敏感比较的一个。
+  LOWER_CASE_TABLE_NAMES_SENSITIVE = 1;
+  // MySQL 值 1：表名统一转小写存储，比较大小写不敏感。
+  LOWER_CASE_TABLE_NAMES_LOWERCASE_STORED = 2;
+  // MySQL 值 2：表名按原样存储，但比较时统一按小写归一，效果上大小写不敏感。
+  LOWER_CASE_TABLE_NAMES_LOWERCASE_COMPARE = 3;
+}
+
+// EndpointConn 是一份端点连接信息+凭据。按最小授权下发：源节点只收到源库这一份，
+// 目标节点只收到目标库这一份；探测任务（proto/control.proto ProbeRequest）复用
+// 同一形状下发给执行探测的节点。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message EndpointConn {
+  string endpoint_id = 1;
+  string host = 2;
+  uint32 port = 3;
+  string username = 4;
+  // 明文下发，传输安全依赖 AMQP/联邦链路 TLS（NODE-BOOT-03）；节点侧日志/上报/回执一律
+  // 脱敏，不得出现在本包之外可观测的任何输出中。
+  string password = 5;
+  TLSConfig tls = 6;
+  // 透传的连接参数，如 charset、connect_timeout 等。
+  map<string, string> params = 7;
+  // 探测得到，用于回环识别的来源身份集合比对；非必填。
+  string server_uuid = 8;
+  LowerCaseTableNames lower_case_table_names = 9;
+}
+
+// MySQLCaps 是实例能力集合，在端点探测阶段算出，随配置整体下发，
+// 预检查与运行期写入路径读同一份，避免两处按版本号各自判断出现分歧。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message MySQLCaps {
+  bool row_metadata_full = 1;
+  bool session_var_admin = 2;
+  bool replication_applier = 3;
+  bool show_routine_priv = 4;
+  bool txn_compression = 5;
+  bool invisible_column = 6;
+  bool gipk = 7;
+  bool set_any_definer = 8;
+  bool binlog_status_stmt = 9;
+  bool vector_type = 10;
+}
+
+// ===== 规则集合 =====
+
+// MatchType 是对象过滤/列过滤等规则里模式串的匹配方式。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum MatchType {
+  MATCH_TYPE_UNSPECIFIED = 0;
+  MATCH_TYPE_EXACT = 1;
+  MATCH_TYPE_GLOB = 2;
+  MATCH_TYPE_REGEX = 3;
+}
+
+// FilterAction 标识一条过滤规则是白名单（放行）还是黑名单（排除）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum FilterAction {
+  FILTER_ACTION_UNSPECIFIED = 0;
+  FILTER_ACTION_INCLUDE = 1;
+  FILTER_ACTION_EXCLUDE = 2;
+}
+
+// ObjectFilterRule 是库/表级 include/exclude 规则（对象过滤，源端执行）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ObjectFilterRule {
+  FilterAction action = 1;
+  MatchType schema_match = 2;
+  string schema_pattern = 3;
+  // 为空表示规则只按库匹配（整库放行/排除）。
+  MatchType table_match = 4;
+  string table_pattern = 5;
+}
+
+// OperationFilter 是 INSERT/UPDATE/DELETE/DDL 的独立开关，仅作用于增量
+// （操作过滤；全量分块写入不受此开关影响）。true=放行。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message OperationFilter {
+  bool insert = 1;
+  bool update = 2;
+  bool delete = 3;
+  bool ddl = 4;
+}
+
+// ColumnFilterRule 是按表的列白名单/黑名单（列过滤，源端执行，P1）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ColumnFilterRule {
+  string schema = 1;
+  string table = 2;
+  FilterAction action = 3;
+  repeated string columns = 4;
+}
+
+// RowFilterRule 是基于列值的表达式过滤（行过滤，源端执行，全量与增量均生效，
+// P1）。expression 使用 expr-lang/expr 语法，节点侧沙箱编译执行（NODE-TF-05）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message RowFilterRule {
+  string schema = 1;
+  string table = 2;
+  string expression = 3;
+  string language = 4;
+  repeated string columns = 5;
+}
+
+// ShadowTableTool 标识影子表切换工具（影子表识别，源端执行，P1）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum ShadowTableTool {
+  SHADOW_TABLE_TOOL_UNSPECIFIED = 0;
+  SHADOW_TABLE_TOOL_GHOST = 1;
+  SHADOW_TABLE_TOOL_PT_OSC = 2;
+}
+
+// ShadowTableRule 识别 gh-ost（_x_gho）/ pt-osc（_x_new）影子表并把 RENAME 切换正确映射
+// 回原表（NODE-BIN-11）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ShadowTableRule {
+  ShadowTableTool tool = 1;
+  string schema = 2;
+  string table = 3;
+  // Optional exact names for a tool configured with nonstandard temp names.
+  // Empty uses the tool's standard names; these are physical table identities.
+  string ghost_table = 4;
+  string old_table = 5;
+}
+
+// RateLimit 是行/字节限流参数（增量限流，源端，P2；全量限流复用同一形状，
+// 见 SnapshotParams）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message RateLimit {
+  uint64 rows_per_sec = 1;
+  uint64 bytes_per_sec = 2;
+}
+
+// 源端规则只投影给源节点。
+message SourceRuleSet {
+  repeated ObjectFilterRule object_filters = 1;
+  OperationFilter operation_filter = 2;
+  repeated ColumnFilterRule column_filters = 3;
+  repeated RowFilterRule row_filters = 4;
+  repeated ShadowTableRule shadow_tables = 5;
+  RateLimit incremental_rate_limit = 6;
+  repeated CleanseTransformRule transforms = 7;
+}
+
+// SchemaMapping/TableMapping/ColumnMapping 分别表达库名、表名、列名重命名
+// （映射，目标端执行，P1）；拆成三个具体消息而不是一个"通用重命名"消息，
+// 是为了避免"column 字段为空即代表表级映射"这种隐式约定，改写规则一目了然。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SchemaMapping {
+  string source_schema = 1;
+  string target_schema = 2;
+}
+
+message TableMapping {
+  string source_schema = 1;
+  string source_table = 2;
+  string target_table = 3;
+}
+
+message ColumnMapping {
+  string source_schema = 1;
+  string source_table = 2;
+  string source_column = 3;
+  string target_column = 4;
+}
+
+// MappingRules 打包三级映射规则。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message MappingRules {
+  repeated SchemaMapping schemas = 1;
+  repeated TableMapping tables = 2;
+  repeated ColumnMapping columns = 3;
+}
+
+// CleanseTransformKind 枚举清洗转换的动作类型（清洗转换，可配执行位置，P2；
+// 本协议把它放进 TargetRuleSet，默认在目标端 transform 执行——理由见 TargetRuleSet 注释）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum CleanseTransformKind {
+  CLEANSE_TRANSFORM_KIND_UNSPECIFIED = 0;
+  CLEANSE_TRANSFORM_KIND_MASK = 1;
+  CLEANSE_TRANSFORM_KIND_CONST_FILL = 2;
+  CLEANSE_TRANSFORM_KIND_TYPE_CONVERT = 3;
+  CLEANSE_TRANSFORM_KIND_LUA = 4;
+  CLEANSE_TRANSFORM_KIND_PLUGIN = 5;
+}
+
+// CleanseTransformRule 的 params 按 kind 解释（MASK 用 pattern/keep_prefix 等；CONST_FILL
+// 用 value；TYPE_CONVERT 用 target_type），用 map<string,string> 而不是每种 kind 各开一个
+// 强类型消息：这是 P2 特性，参数集合还在探索阶段，过早锁定强类型结构反而阻碍演进；
+// 一旦某个 kind 的参数稳定下来，应改为强类型字段（只增不改，遵守协议演进规则）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum TransformExecutionSide {
+  TRANSFORM_EXECUTION_SIDE_UNSPECIFIED = 0;
+  TRANSFORM_EXECUTION_SIDE_SOURCE = 1;
+  TRANSFORM_EXECUTION_SIDE_TARGET = 2;
+}
+
+message CleanseTransformRule {
+  string schema = 1;
+  string table = 2;
+  string column = 3;
+  CleanseTransformKind kind = 4;
+  map<string, string> params = 5;
+  // Absence retains the original target-side default. Manager splits rules
+  // into the corresponding role; a node rejects the opposite role explicitly.
+  TransformExecutionSide execution_side = 6;
+}
+
+// 映射在目标端执行；清洗转换根据 execution_side 投影到源端或目标端。
+message TargetRuleSet {
+  MappingRules mappings = 1;
+  repeated CleanseTransformRule transforms = 2;
+}
+
+// ===== 全量 / 写入 / 冲突 / DDL / 错误策略 =====
+
+// SnapshotParams 是全量参数（全量参数，两端使用：源端负责读取相关字段，
+// write_concurrency 由 TargetSideConfig.snapshot_write_concurrency 单独表达，因为它是
+// 目标端独占的写入并发配置，不随源端这份下发给源节点）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SnapshotParams {
+  uint32 read_concurrency = 1;
+  uint32 chunk_rows = 2;
+  uint32 max_txn_rows = 3;
+  uint32 max_txn_bytes = 4;
+  RateLimit rate_limit = 5;
+  // 是否从只读从库读取（NODE-SNAP-13，P1）；true 时 L/H 与分块读取都在该从库完成。
+  bool read_from_replica = 6;
+  // Same-center registered read endpoint; required only when read_from_replica is true.
+  string replica_endpoint_id = 7;
+}
+
+// WritePolicy 是目标端写入参数（写入参数）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message WritePolicy {
+  uint32 batch_size = 1;
+  // 并行回放度（NODE-OUT-10，P1）；0/1 表示单连接顺序回放（首版默认，ADR-06）。
+  uint32 parallel_replay_degree = 2;
+  // 同事务内同表同类操作的多行合并为多值语句（NODE-OUT-11，P1）。
+  bool merge_same_table_rows = 3;
+  // SQL准备可并行，提交须等待源端更早的事务成功；默认false。
+  bool ordered_commit = 4;
+}
+
+// LWWTableConfig 是启用 LWW 冲突策略时，某张表用于比较新旧的时间戳列
+// （需求 LOOP-12/LOOP-13）。未在此列出的表回退源覆盖，并在预检查提示。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message LWWTableConfig {
+  string schema = 1;
+  string table = 2;
+  string timestamp_column = 3;
+}
+
+// ConflictMaskRule uses source object names and exact column names. Mappings
+// are applied by the target before reporting. All selected values, including
+// positioning keys, are replaced with "***" in report copies only.
+message ConflictMaskRule {
+  string schema = 1;
+  string table = 2;
+  repeated string columns = 3;
+}
+
+// ConflictPolicy 是目标端冲突处理策略（冲突策略）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ConflictPolicy {
+  ConflictMode mode = 1;
+  // mode=CONFLICT_MODE_LWW 时按表配置时间戳列。
+  repeated LWWTableConfig lww_tables = 2;
+  repeated ConflictMaskRule mask_rules = 3;
+}
+
+// DDLMode 标识目标端对增量 DDL 的处理方式（DDL 策略）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum DDLMode {
+  DDL_MODE_UNSPECIFIED = 0;
+  DDL_MODE_SYNC = 1;
+  DDL_MODE_IGNORE = 2;
+  DDL_MODE_ONLY_FROM_CENTERS = 3;
+}
+
+// DDLPolicy 是目标端 DDL 策略（DDL 策略；DROP/TRUNCATE 等危险 DDL 单独开关）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message DDLPolicy {
+  DDLMode mode = 1;
+  // mode=DDL_MODE_ONLY_FROM_CENTERS 时生效，取值为中心 code。
+  repeated string only_from_centers = 2;
+  bool allow_drop = 3;
+  bool allow_truncate = 4;
+  // Used only when the original DEFINER account is absent on the target.
+  // Empty retains rejection; accepts CURRENT_USER or a MySQL user@host identity.
+  string definer_fallback = 5;
+}
+
+// ErrorPolicy 是目标端错误处理策略（错误策略）：可重试错误按次数与退避重试；
+// 不可重试错误默认停止，"跳过并记录"必须显式开启（对应 Manager 侧显式操作并审计）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ErrorPolicy {
+  uint32 retryable_max_retries = 1;
+  uint32 retry_backoff_ms = 2;
+  uint32 retry_backoff_max_ms = 3;
+  bool skip_and_log_unretryable = 4;
+}
+
+// ===== 结构迁移计划（P1；Manager 生成，目标端执行） =====
+
+// SchemaMigrationAction 是 Manager 对每个结构对象给出的处理动作（MGR-SCH-04/05）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum SchemaMigrationAction {
+  SCHEMA_MIGRATION_ACTION_UNSPECIFIED = 0;
+  SCHEMA_MIGRATION_ACTION_CREATE = 1;
+  SCHEMA_MIGRATION_ACTION_SKIP = 2;
+  SCHEMA_MIGRATION_ACTION_BLOCK = 3;
+  SCHEMA_MIGRATION_ACTION_RECREATE = 4;
+}
+
+// SchemaMigrationStep 是结构迁移计划中的一条语句。seq 对应
+// `<结构迁移合成UUID>:<seq>` 的 k，目标端据此以 gtid_next 幂等执行（MGR-SCH-06/NODE-SCH-02）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SchemaMigrationStep {
+  uint64 seq = 1;
+  SchemaObjectKind kind = 2;
+  string schema = 3;
+  string object_name = 4;
+  SchemaMigrationAction action = 5;
+  // action=CREATE/RECREATE 时必填：Manager 改写管线（internal/schemamig）产出的可执行 DDL。
+  string ddl = 6;
+  // action=BLOCK 时的阻断原因，面向用户展示。
+  string block_reason = 7;
+  // Triggers and deferred constraints execute after snapshot convergence.
+  bool after_snapshot = 8;
+  // Owning table for a named FOREIGN_KEY constraint.
+  string table_name = 9;
+  // A temporary view created by this same immutable migration plan.
+  bool view_placeholder = 10;
+  // Final replacement step and definition for replay after replacement committed.
+  uint64 view_replacement_seq = 11;
+  string view_replacement_ddl = 12;
+  // 最终替换必须关联本计划已创建的占位步骤及其实际定义。
+  uint64 view_placeholder_seq = 13;
+  string view_placeholder_ddl = 14;
+}
+
+// SchemaMigrationPlan 是随 TargetSideConfig 下发的结构迁移计划整体。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SchemaMigrationPlan {
+  // 本次 run_id 分配的结构迁移合成 UUID，与全量合成 UUID 分开登记（MGR-SCH-06）。
+  string schema_uuid = 1;
+  repeated SchemaMigrationStep steps = 2;
+}
+
+// ===== 队列声明参数 =====
+
+message QueueDecl {
+  string incremental_queue = 1;
+  // 非权威值，仅供诊断展示，定位与 incremental_queue 相同，对应
+  // internal/transport.PipelineSnapshotQueue(pipeline_id)（"xdts.pl.<pipeline_id>.snap"）。
+  string snapshot_queue = 2;
+  // x-delivery-limit（MQ-03，防止数据消息被静默丢弃）。
+  uint32 incremental_delivery_limit = 3;
+  uint32 incremental_prefetch = 4;
+}
+
+// ===== 公共部分 + 按角色投影 =====
+
+message CenterInfo {
+  string code = 1;
+  string name = 2;
+  bool is_manager_center = 3;
+}
+
+// TopologyEdge 表达一条 pipeline 的中心间连线，供节点做回环静态校验的本地兜底展示
+// （静态校验本身在 Manager 侧完成），节点侧目前只需要它做诊断展示。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message TopologyEdge {
+  string source_center = 1;
+  string target_center = 2;
+  string pipeline_id = 3;
+}
+
+message Topology {
+  repeated CenterInfo centers = 1;
+  repeated TopologyEdge edges = 2;
+}
+
+// OriginUUIDSet 是某个中心登记的全部来源身份 UUID（server_uuid / 手工补充 / 合成 UUID，
+// "来源映射"）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message OriginUUIDSet {
+  string center_code = 1;
+  repeated string uuids = 2;
+  // Physical database identities, excluding synthetic snapshot/schema UUIDs.
+  repeated string server_uuids = 3;
+}
+
+// CommonConfig 是源节点与目标节点都会拿到的公共部分（PipelineSpec.Common）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message CommonConfig {
+  string pipeline_id = 1;
+  // 任何字段变化都递增；节点必须拒绝版本倒退（NODE-CFG-05）。
+  uint64 config_version = 2;
+  // 只在"重新初始化"时递增。
+  uint64 run_id = 3;
+  uint32 protocol_version = 4;
+  Topology topology = 5;
+  // 中心 → 来源 UUID 集合映射；运行期整体替换。
+  repeated OriginUUIDSet origin_map = 6;
+  // xdts.data。
+  string data_exchange = 7;
+  // pl.<pipeline_id>
+  string routing_key = 8;
+  // pl.<pipeline_id>.snap
+  string snap_routing_key = 9;
+  // Stable identity of a confirmed REINIT; retained after command completion.
+  ReinitIdentity reinit_identity = 10;
+  // Probed physical identities only; no peer connection or credentials.
+  DatabaseRoute database_route = 11;
+  // Explicitly enabled publication concurrency, projected to both roles.
+  IncrementalWindowPolicy incremental_window = 12;
+  // Enabled only when both assigned Nodes advertise this exact capability.
+  bool snapshot_plan_extensions_v1 = 13;
+  // Role-specific stopped-run handover, imported atomically before assembly.
+  // Retained for retry; a durable local seal prevents replay over newer progress.
+  PipelineStateBundle state_bundle = 14;
+  // Both assigned Nodes explicitly advertise snapshot_table_creation_v1.
+  bool snapshot_table_creation_v1 = 15;
+  // Original dependency projection requires two explicitly capable Nodes.
+  bool ddl_source_dependencies_v1 = 16;
+  bool snapshot_table_recovery_v1 = 17;
+}
+
+message PipelineStateRecord {
+  string collection = 1;
+  string id = 2;
+  bytes bson = 3;
+}
+
+message PipelineStateBundle {
+  string pipeline_id = 1;
+  uint64 run_id = 2;
+  PipelineRole role = 3;
+  string snapshot_uuid = 4;
+  string source_node_id = 5;
+  string destination_node_id = 6;
+  // The migration's committed configuration version, not later hot updates.
+  uint64 config_version = 7;
+  repeated PipelineStateRecord records = 8;
+  string digest = 9;
+}
+
+message IncrementalWindowPolicy {
+  // 0/1 retain single-batch publication; maximum 128.
+  uint32 max_batches = 1;
+  // 0 defaults to 64 MiB; the Node's shared resource budget also applies.
+  uint64 max_bytes = 2;
+  // 0 defaults to 60 seconds; a remaining gap stops the target pipeline.
+  uint32 reorder_timeout_ms = 3;
+}
+
+message DatabaseRoute {
+  string source_center = 1;
+  string target_center = 2;
+  string source_server_uuid = 3;
+  string target_server_uuid = 4;
+  // Enable durable per-GTID lineage only after both roles advertise the v1
+  // capability and the endpoint metadata store passes prechecks. Absent=false
+  // retains center-based protection; no peer credentials are carried here.
+  bool persistent_lineage_v1 = 5;
+}
+
+message ReinitIdentity {
+  uint64 from_run_id = 1;
+  uint64 new_run_id = 2;
+  string digest = 3;
+  string snapshot_uuid = 4;
+  string schema_uuid = 5;
+  // Current command intent, checked on a fresh pull before destructive work.
+  uint64 cmd_seq = 6;
+}
+
+enum ReinitTargetHandling {
+  REINIT_TARGET_HANDLING_UNSPECIFIED = 0;
+  REINIT_TARGET_HANDLING_KEEP = 1;
+  REINIT_TARGET_HANDLING_CLEAR = 2;
+}
+
+message ReinitTargetTable {
+  string schema = 1;
+  string table = 2;
+  // Empty only when the confirmed structure plan creates the missing table.
+  string expected_ddl = 3;
+}
+
+message ReinitTargetPlan {
+  ReinitTargetHandling handling = 1;
+  string prepare_uuid = 2;
+  string digest = 3;
+  repeated ReinitTargetTable tables = 4;
+}
+
+message ReinitSourceTable {
+  string schema = 1;
+  string table = 2;
+  // Required confirmed source definition; its CREATE identity must match schema/table.
+  string expected_ddl = 3;
+}
+
+message ReinitSourcePlan {
+  string digest = 1;
+  repeated ReinitSourceTable tables = 2;
+}
+
+// OriginPolicyMode 定义源端回环识别的来源策略。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum OriginPolicyMode {
+  ORIGIN_POLICY_MODE_UNSPECIFIED = 0;
+  ORIGIN_POLICY_MODE_LOCAL_ONLY = 1;
+  ORIGIN_POLICY_MODE_INCLUDE_ORIGINS = 2;
+  ORIGIN_POLICY_MODE_EXCLUDE_ORIGINS = 3;
+  ORIGIN_POLICY_MODE_ALL = 4;
+}
+
+message OriginPolicy {
+  OriginPolicyMode mode = 1;
+  // mode=INCLUDE_ORIGINS/EXCLUDE_ORIGINS 时生效，取值为中心 code。
+  repeated string centers = 2;
+  uint32 max_hops = 3;
+  bool drop_unknown_origin = 4;
+}
+
+// InitMode 定义初始化方式；"仅增量"的四种起始位点子类型由
+// SourceSideConfig.start_position.kind 进一步细分，不在这里展开成四个枚举值。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum InitMode {
+  INIT_MODE_UNSPECIFIED = 0;
+  INIT_MODE_SNAPSHOT_AND_INCREMENTAL = 1;
+  INIT_MODE_INCREMENTAL_ONLY = 2;
+  INIT_MODE_SNAPSHOT_ONLY = 3;
+  INIT_MODE_SCHEMA_ONLY = 4;
+}
+
+// SourceSideConfig 下发给源节点（PipelineSpec.Source）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SourceSideConfig {
+  EndpointConn endpoint = 1;
+  // dump 用 server_id，全局唯一（MGR-PL-06）。
+  uint32 binlog_server_id = 2;
+  InitMode init_mode = 3;
+  StartPosition start_position = 4;
+  // init_mode 含全量（SNAPSHOT_AND_INCREMENTAL/SNAPSHOT_ONLY）时必填。
+  SnapshotParams snapshot = 5;
+  // 全量合成 UUID，本次 run_id 分配（NODE-SNAP-03），init_mode 不含全量时为空。
+  string snapshot_uuid = 6;
+  SourceRuleSet rules = 7;
+  OriginPolicy origin_policy = 8;
+  MySQLCaps caps = 9;
+  ReinitSourcePlan reinit_plan = 10;
+  // Explicit position edits use a separate revision, applied once per checkpoint.
+  uint64 position_revision = 11;
+  // Replica credentials belong exclusively to the source role. Incremental reads
+  // continue using endpoint; L/H and snapshot chunks use this endpoint together.
+  EndpointConn snapshot_endpoint = 12;
+}
+
+// TargetSideConfig 下发给目标节点（PipelineSpec.Target）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message TargetSideConfig {
+  // Source policy limit mirrored for defensive target lineage checks.
+  uint32 max_origin_hops = 16;
+  EndpointConn endpoint = 1;
+  QueueDecl queue_decl = 2;
+  // 未开启结构迁移时为空。
+  SchemaMigrationPlan schema_plan = 3;
+  TargetRuleSet rules = 4;
+  WritePolicy write_policy = 5;
+  ConflictPolicy conflict_policy = 6;
+  DDLPolicy ddl_policy = 7;
+  ErrorPolicy error_policy = 8;
+  uint32 snapshot_write_concurrency = 9;
+  MySQLCaps caps = 10;
+  // 全量目标消费门控及合成 GTID，不包含源端连接凭据。
+  InitMode init_mode = 11;
+  string snapshot_uuid = 12;
+  uint32 snapshot_max_txn_rows = 13;
+  uint32 snapshot_max_txn_bytes = 14;
+  // 源端标识符匹配规则供目标映射使用；不包含源端连接凭据。
+  LowerCaseTableNames source_lower_case_table_names = 15;
+  ReinitTargetPlan reinit_plan = 17;
+  // Source tool-table identities needed to map physical cutovers. No credentials.
+  repeated ShadowTableRule shadow_tables = 18;
+}

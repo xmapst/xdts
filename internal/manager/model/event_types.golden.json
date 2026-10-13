@@ -1,0 +1,14 @@
+{
+  "//": "由 internal/manager/model 的 TestEventTypesGoldenMatchesSource 从 event.go 的常量块生成。不要手工编辑：改 event.go 的常量块后跑 XDTS_UPDATE_GOLDEN=1 go test ./internal/manager/model/ 重生成。下游消费方（2026-09-29 复核后的真实结构，与本注释早先写的『共三处』不同）：**直接 import 本文件的只有一处**——src/api/eventTypesGolden.ts，它自称『后端 EventType 取值全集的唯一跨目录入口』，并说明本文件消失时前端构建会直接失败、不是静默退化成空列表。src/api/events.ts 与 src/mocks/eventsMock.ts 从它取 GOLDEN_EVENT_TYPES；src/features/logs/EventsPage.tsx 再经 events.ts 取，它自己只在注释里引本文件。所以按层数是 1 直接 + 2 间接 + 1 三层，不是并列的三处。union 仍然无法生成（resolveJsonModule 导入的 JSON 数组推不出字面量类型），但『只能手写并与本文件机械比对』这半句里的比对**已经建好了**：src/api/events.golden.test.ts 断言长度相等、成员集合排序后相等、顺序也相等，并先断言 GOLDEN_EVENT_TYPES 长度大于 0（否则两个空数组会平凡相等）。另有两处软消费方：src/i18n/locales/zh-CN.ts 与 src/i18n/locales/en-US.ts 的 events.types 文案表——缺键不会坏，渲染层会兜底显示后端原值，但界面上就是一串英文标识符。",
+  "event_types": [
+    "backpressure",
+    "config_applied",
+    "conflict",
+    "ddl",
+    "error",
+    "link_probe_failed",
+    "local_store_rebuild",
+    "node_offline",
+    "unknown_origin"
+  ]
+}

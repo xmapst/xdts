@@ -1,0 +1,94 @@
+# xdts Manager 生产配置示例。
+# 配置优先级：本文件 < XDTS_* 环境变量 < 命令行参数。
+# DSN、AMQP 凭据、初始管理员密码建议通过环境变量或密钥文件注入。
+
+http:
+  # 生产环境建议只监听本机，由反向代理提供 TLS 和公网入口。
+  listen: "127.0.0.1:8080"
+  shutdown_timeout: 15s
+  cookie_secure: true
+
+database:
+  # 管理库必须是独立的 MySQL 数据库，不要复用业务端点数据库。
+  # 示例值会被 XDTS_DATABASE_DSN 覆盖。
+  dsn: "xdts_manager:change-me@tcp(127.0.0.1:3306)/xdts_manager?parseTime=true&loc=UTC&charset=utf8mb4"
+
+amqp:
+  # Manager 与同一管理中心的 Node 使用同一个 vhost。
+  # 生产环境优先使用 amqps，并限制该账号只访问此 vhost。
+  url: "amqps://xdts_manager:change-me@rabbitmq.example.com:5671/xdts"
+  # 日志允许丢弃旧消息；已声明队列的 x-max-length 不能原地修改。
+  log_queue_max_length: 100000
+
+auth:
+  session_ttl: 12h
+  local:
+    enabled: true
+    # 仅在本地账号表为空时创建初始管理员；已有账号时会跳过。
+    # 生产环境请改为 XDTS_AUTH_LOCAL_BOOTSTRAP_USER/PASSWORD 注入。
+    bootstrap_user: "change-me-admin"
+    bootstrap_password: "change-me-password"
+    argon2:
+      memory_kib: 19456
+      iterations: 2
+      parallelism: 1
+      salt_length: 16
+      key_length: 32
+  ldap:
+    enabled: false
+    ca_file: ""
+    timeout: 10s
+    url: "ldaps://ldap.example.com:636"
+    bind_dn: ""
+    bind_password: ""
+    user_base_dn: ""
+    user_filter: "(uid=%s)"
+    group_role_mapping: {}
+  oidc:
+    enabled: false
+    ca_file: ""
+    timeout: 10s
+    state_ttl: 5m
+    issuer: "https://sso.example.com/"
+    client_id: "xdts"
+    client_secret: ""
+    redirect_url: "https://xdts.example.com/api/v1/auth/oidc/callback"
+    scopes: ["openid", "profile", "email"]
+    role_claim: "groups"
+    claim_role_mapping: {}
+  # 外部认证用户未命中映射时的角色：admin、readonly 或 deny。
+  default_external_role: readonly
+  lockout:
+    threshold: 5
+    window: 15m
+    lock_duration: 15m
+
+dispatch:
+  reconcile_interval: 15s
+
+background_tasks:
+  reclaim_interval: 30s
+  inspection_interval: 1m
+  alert_interval: 15s
+  partition_check_interval: 24h
+  # 周期性端点探测默认关闭；可在确认探测凭据和负载后开启。
+  endpoint_probe_enabled: false
+
+pipeline:
+  # 全局分配 MySQL binlog server_id 的闭区间，0 保留给匿名复制客户端。
+  binlog_server_id_range_min: 4000000000
+  binlog_server_id_range_max: 4294967295
+
+log:
+  format: json
+  level: info
+  file: ""
+  max_size_mb: 50
+  max_backups: 7
+  max_age_days: 7
+
+retention:
+  logs: 360h
+  metrics: 360h
+  events: 720h
+  conflicts: 720h

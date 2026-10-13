@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+// xdts.v1 是控制面、上报面与数据面共用的协议包名；同一包名跨多个 .proto 文件声明，
+// 编译时一并传给 protoc 即可互相直接引用消息，无需包前缀（参见 internal/iproto/generate.go）。
+package xdts.v1;
+
+option go_package = "github.com/xmapst/xdts/internal/iproto;iproto";
+
+// proto/common.proto 存放跨多个消息文件复用的枚举与错误消息。
+// 本文件不放"信封"：AMQP properties / headers位于消息体之外的
+// 传输层，属于 internal/iproto 的手写 Go 代码（internal/iproto/envelope.go），不在这里定义成 protobuf message，
+// 避免信封字段与消息体重复表达。
+
+// Error 是所有回执类消息表达失败原因的统一形状。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message Error {
+  // 稳定错误码，供调用方做程序判断，如 "PROTOCOL_INCOMPATIBLE"、"REGISTER_CODE_INVALID"、
+  // "CONFIG_VERSION_STALE"、"SIGNATURE_INVALID"、"TIMESTAMP_OUT_OF_WINDOW"。
+  string code = 1;
+  string message = 2;
+}
+
+// PipelineRole 标识一个节点在某条 pipeline 中扮演的角色；同一节点可同时是
+// pipeline X 的源节点与 pipeline Y 的目标节点，角色始终随 pipeline_id 成对出现。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum PipelineRole {
+  PIPELINE_ROLE_UNSPECIFIED = 0;
+  PIPELINE_ROLE_SOURCE = 1;
+  PIPELINE_ROLE_TARGET = 2;
+}
+
+// PipelineState 对应 pipeline 状态机的取值；期望状态只会是
+// RUNNING / PAUSED / STOPPED 三者之一，其余均为实际状态（节点离线时实际状态记为"未知"，
+// 即不下发本枚举而不是新增一个"未知"取值，避免与 UNSPECIFIED 混淆）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum PipelineState {
+  PIPELINE_STATE_UNSPECIFIED = 0;
+  PIPELINE_STATE_DRAFT = 1;
+  PIPELINE_STATE_PRECHECKING = 2;
+  PIPELINE_STATE_DEPLOYING = 3;
+  PIPELINE_STATE_MIGRATING = 4;
+  PIPELINE_STATE_SNAPSHOTTING = 5;
+  PIPELINE_STATE_CATCHING_UP = 6;
+  PIPELINE_STATE_RUNNING = 7;
+  PIPELINE_STATE_PAUSED = 8;
+  PIPELINE_STATE_ERROR = 9;
+  // STOPPED 表示配置仍由节点持有而数据流停止；删除由 deleted 标记触发。
+  PIPELINE_STATE_STOPPED = 10;
+}
+
+// NodeState 定义节点状态词表；在线情况由 Manager 根据心跳判定，
+// 禁用和撤销由管理操作决定。
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_REGISTERING = 1;
+  NODE_STATE_ONLINE = 2;
+  NODE_STATE_OFFLINE = 3;
+  NODE_STATE_DISABLED = 4;
+  NODE_STATE_REVOKED = 5;
+}
+
+// SnapshotRunState 对应全量运行状态机的取值。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum SnapshotRunState {
+  SNAPSHOT_RUN_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_RUN_STATE_PLANNING = 1;
+  SNAPSHOT_RUN_STATE_READING = 2;
+  SNAPSHOT_RUN_STATE_CHUNKS_DONE = 3;
+  SNAPSHOT_RUN_STATE_CONVERGING = 4;
+  SNAPSHOT_RUN_STATE_CONVERGED = 5;
+  SNAPSHOT_RUN_STATE_PAUSED = 6;
+  SNAPSHOT_RUN_STATE_FAILED = 7;
+}
+
+// ConflictMode 对应冲突策略的三种取值（源覆盖 / LWW / 停止），
+// 用于 proto/config.proto 的 ConflictPolicy 与 proto/report.proto 的冲突事件详情，两处必须一致。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum ConflictMode {
+  CONFLICT_MODE_UNSPECIFIED = 0;
+  CONFLICT_MODE_SOURCE_WINS = 1;
+  CONFLICT_MODE_LWW = 2;
+  CONFLICT_MODE_STOP = 3;
+}
+
+// SchemaObjectKind 枚举结构迁移涉及的对象类型（需求 MGR-SCH-01），
+// 同时供 proto/control.proto 的 defs 探测结果与 proto/config.proto 的结构迁移计划复用。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum SchemaObjectKind {
+  SCHEMA_OBJECT_KIND_UNSPECIFIED = 0;
+  SCHEMA_OBJECT_KIND_DATABASE = 1;
+  SCHEMA_OBJECT_KIND_TABLE = 2;
+  SCHEMA_OBJECT_KIND_VIEW = 3;
+  SCHEMA_OBJECT_KIND_PROCEDURE = 4;
+  SCHEMA_OBJECT_KIND_FUNCTION = 5;
+  SCHEMA_OBJECT_KIND_TRIGGER = 6;
+  SCHEMA_OBJECT_KIND_EVENT = 7;
+  SCHEMA_OBJECT_KIND_FOREIGN_KEY = 8;
+}
+
+// InitPositionKind 标识起始位点的原始输入形式。节点内部一律使用
+// 换算后的 GTID 集合（NODE-POS-04），kind 与原始输入字段只用于审计与界面回显换算来源。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum InitPositionKind {
+  INIT_POSITION_KIND_UNSPECIFIED = 0;
+  INIT_POSITION_KIND_LATEST = 1;
+  INIT_POSITION_KIND_GTID_SET = 2;
+  INIT_POSITION_KIND_BINLOG_POS = 3;
+  INIT_POSITION_KIND_TIMESTAMP = 4;
+}
+
+// StartPosition 是换算完成后的起始位点表达，config.proto（SourceSideConfig）与
+// control.proto（SetPositionArgs、位点探测回执）共用同一形状。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message StartPosition {
+  InitPositionKind kind = 1;
+  // 内部一律使用的换算结果（NODE-POS-04）。kind=LATEST 时同样填充（当前 gtid_executed）。
+  string gtid_set = 2;
+  // kind=BINLOG_POS 时的原始输入，仅用于留痕，不参与运行期判断。
+  string source_file = 3;
+  uint64 source_offset = 4;
+  // kind=TIMESTAMP 时的原始输入，仅用于留痕。
+  int64 source_ts_ms = 5;
+  // 时间点换算经 Manager 显式确认后方可用，原时间仅保留审计。
+  bool timestamp_confirmed = 6;
+  int64 txn_commit_ts_ms = 7;
+  // A confirmed position edit preserves the probed GTID even for LATEST.
+  bool resolved = 8;
+}

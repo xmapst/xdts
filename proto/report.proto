@@ -1,0 +1,357 @@
+syntax = "proto3";
+
+package xdts.v1;
+
+import "common.proto";
+import "data.proto";
+import "control.proto";
+
+option go_package = "github.com/xmapst/xdts/internal/iproto;iproto";
+
+// 上报面包含节点心跳、流水线状态与进度、日志批次和事件。
+
+// ===== 心跳（NODE-RPT-01） =====
+
+// ResourceUsage 是节点自身资源占用。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ResourceUsage {
+  double cpu_percent = 1;
+  uint64 mem_bytes = 2;
+  uint32 goroutines = 3;
+  // mem_percent is optional: absence is unknown, while zero is a valid observation.
+  // Consumers preserve presence and calculate percent against the reported effective memory limit.
+  optional double mem_percent = 4;
+  // mem_rss_bytes 是进程常驻集（Linux 下取 /proc/self/statm 第二字段 × pagesize），
+  // 即 mem_percent 的分子。
+  //
+  // mem_bytes（字段 2）是 runtime.MemStats.Sys——Go 运行时向 OS 取得的地址空间
+  // 总量，包含已归还、已 madvise、从未触碰的部分；mem_rss_bytes 是实际驻留物理
+  // 内存的字节数。两者可以相差数倍，方向不固定，没有任何换算关系。
+  //
+  // 这一条必须写在协议里，因为二者在同一个界面上并排显示：只看到 "mem_bytes=2GB"
+  // 与 "mem_percent=3%" 的运维会去把它们对上，而它们本来就对不上——分子根本
+  // 不是同一个。mem_bytes 是已发布字段、语义只增不改，所以修法是把真正的分子
+  // 单独上报，不是改它。
+  //
+  // 采不到是真实存在的：非 Linux 平台整份采样恒为三项全 nil
+  // （internal/node/reporter/memory_other.go），Linux 上 /proc/self/statm 读不到或读不懂时
+  // 本项单独为 nil（internal/node/reporter/memory_linux.go 的 RSSBytes *uint64）。裸标量下这些情形一律
+  // 发出 0——而"常驻 0 字节"会紧挨着一个真实的内存预算显示出来，是个不报错、
+  // 不留日志、看起来只是有点小的值，与 mem_percent 那里的"0%"同一形状。
+  optional uint64 mem_rss_bytes = 5;
+  // Resolve cgroup limits using the process membership path before fixed-path fallbacks.
+  // Unlimited limits use host memory; raw sentinel values are not usable limits.
+  optional uint64 mem_total_bytes = 6;
+}
+
+// PipelineHeartbeatEntry 是心跳里携带的"该节点承载的 pipeline 列表及各自 config_version"
+// 的一项（NODE-RPT-01）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PipelineHeartbeatEntry {
+  string pipeline_id = 1;
+  uint64 config_version = 2;
+  PipelineRole role = 3;
+}
+
+// LocalStoreStats 是节点本地状态库（xdoc）的运行统计（NODE-XDOC-08："状态库大小、提交耗时
+// 随心跳上报"）。单独成 message 而不是把两个字段直接摊平进 NodeHeartbeat，是为了和
+// ResourceUsage 保持同样的分组方式（"节点自身资源占用"与"本地状态库统计"是两类不同来源的
+// 指标），也给后续可能追加的统计项（如提交次数、失败次数）留位置，不需要再改 NodeHeartbeat
+// 本身。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message LocalStoreStats {
+  // store_size_bytes 是本地状态库文件在磁盘上的字节数。
+  uint64 store_size_bytes = 1;
+  int64 last_commit_duration_ms = 2;
+}
+
+// NodeHeartbeat 默认周期 5s（NODE-RPT-01）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message NodeHeartbeat {
+  string node_id = 1;
+  int64 ts_ms = 2;
+  ResourceUsage resource = 3;
+  string node_version = 4;
+  repeated PipelineHeartbeatEntry pipelines = 5;
+  LocalStoreStats local_store = 6;
+  // uptime_seconds 是节点进程自身已运行的秒数。Manager 侧同样算不出来：它只能算
+  // "我第一次见到这个节点至今"，那是另一个语义，而且 Manager 一重启就归零——
+  // 拿它冒充会得到一个看起来合理的错数。
+  //
+  // 用 optional 的理由同 mem_percent：裸标量下"没发"与"刚启动 0 秒"不可分辨，
+  // 而"刚启动"恰恰是个真实存在的状态。presence 判定同样是判指针而不是用
+  // GetUptimeSeconds()（nil 时返回 0）。
+  //
+  // 选"已运行时长"而不是"启动时刻"，有两条理由：①时长由节点自己计量，不受
+  // 两端时钟偏移影响；②节点掉线后界面显示的时长会停在最后一次心跳，而"启动时刻"
+  // 会让前端对着一个已经死掉的节点继续把时间累加上去——后者是个不会报错的错值。
+  optional int64 uptime_seconds = 7;
+  // Optional presence distinguishes an absent report from a reported empty list.
+  // Validate the declared count against the accompanying pipeline entries.
+  optional uint32 pipelines_known_count = 8;
+}
+
+// ===== pipeline 状态与进度（NODE-RPT-02/03） =====
+
+// PipelineStatus 在状态变化时即时上报，并周期性上报完整状态（NODE-RPT-02）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PipelineStatus {
+  string pipeline_id = 1;
+  PipelineRole role = 2;
+  PipelineState state = 3;
+  // Actual configuration version of this observation, filled by all producers.
+  // Manager rejects future versions and ignores versions older than the latest
+  // accepted side observation. Version 0 remains a valid initial configuration.
+  uint64 config_version = 4;
+  uint64 run_id = 5;
+  string last_error = 6;
+  int64 ts_ms = 7;
+  // 全量运行状态；非全量阶段为 SNAPSHOT_RUN_STATE_UNSPECIFIED。
+  SnapshotRunState snapshot_state = 8;
+  // Reporter process session, assigned once when a new status is received.
+  // Retries and periodic publication preserve the same session and sequence.
+  string status_session_id = 9;
+  int64 status_session_started_at_ms = 10;
+  uint64 status_seq = 11;
+  // Controller assembly identity; retained by its workers through hot updates.
+  // Empty for configured-but-stopped startup records without a live instance.
+  string runtime_instance_id = 12;
+}
+
+// QueueWatermark 保存模块内部队列的当前长度和容量。
+message QueueWatermark {
+  string module = 1;
+  uint32 len = 2;
+  uint32 cap = 3;
+}
+
+// SnapshotTableStatus 是全量按表进度的状态（pipeline_snapshot_tables）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum SnapshotTableStatus {
+  SNAPSHOT_TABLE_STATUS_UNSPECIFIED = 0;
+  SNAPSHOT_TABLE_STATUS_PENDING = 1;
+  SNAPSHOT_TABLE_STATUS_READING = 2;
+  SNAPSHOT_TABLE_STATUS_DONE = 3;
+  SNAPSHOT_TABLE_STATUS_FAILED = 4;
+}
+
+// TableProgress 是全量期间按表展示的进度（NODE-SNAP-10）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message TableProgress {
+  string schema = 1;
+  string table = 2;
+  int64 estimated_rows = 3;
+  int64 done_rows = 4;
+  SnapshotTableStatus status = 5;
+  // Present only when this source knows the original plan's chunk counts.
+  optional uint64 total_chunks = 6;
+  optional uint64 done_chunks = 7;
+  // Average newly read/published rows over this active reader's elapsed time;
+  // restored chunks do not count as new reads. Absent means unknown.
+  optional double rows_per_sec = 8;
+}
+
+// SnapshotProgress 是 PipelineProgress 中全量期间附带的部分（NODE-RPT-03/NODE-SNAP-10）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SnapshotProgress {
+  uint64 total_chunks = 1;
+  uint64 done_chunks = 2;
+  repeated TableProgress tables = 3;
+  // 追平（Converging）阶段距 H 的剩余事务量估计。
+  uint64 catchup_remaining_txns = 4;
+  // Base counts retain their fixed-plan meaning. Additional immutable plans
+  // report their cumulative prefix separately after explicit negotiation.
+  SnapshotPlanExtensionProgress extension = 5;
+}
+
+message SnapshotPlanExtensionProgress {
+  uint64 sequence = 1;
+  uint64 total_chunks = 2;
+  uint64 done_chunks = 3;
+}
+
+// PipelineProgress 默认周期 5s（NODE-RPT-03），携带源端与目标端的运行指标。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message PipelineProgress {
+  string pipeline_id = 1;
+  PipelineRole role = 2;
+  int64 ts_ms = 3;
+  // 三级位点：源端角色下 read/published 有意义，目标端角色下 applied 有意义。
+  string read_gtid_set = 4;
+  string published_gtid_set = 5;
+  string applied_gtid_set = 6;
+  // 最近读取/应用事件的源端提交时刻，用于端到端延迟计算。
+  int64 source_event_ts_ms = 7;
+  double lag_ms = 8;
+  double rows_per_sec = 9;
+  double txns_per_sec = 10;
+  double bytes_per_sec = 11;
+  // 在途窗口：已发布未确认的批次数/字节数。
+  uint32 inflight_batches = 12;
+  uint64 inflight_bytes = 13;
+  repeated QueueWatermark module_queues = 14;
+  // 目标节点 passive declare 取得的待投递消息数，不含 unacknowledged。
+  // 联邦巡检总积压使用 BrokerBacklog.messages（Management API），不得与此值混同。
+  uint64 data_queue_backlog = 15;
+  uint64 error_count = 16;
+  uint64 conflict_count = 17;
+  // 全量期间附带；非全量阶段不填充。
+  SnapshotProgress snapshot = 18;
+  // 全量进度归属的初始化运行；不可用 pipeline 当前 run 推测迟到消息。
+  uint64 run_id = 19;
+  // Independent observation times: queue inspection must not refresh cached
+  // rates/positions. Absent means this producer cannot attest their freshness.
+  optional int64 metrics_observed_ts_ms = 20;
+  optional int64 queue_observed_ts_ms = 21;
+  // Source-only recovery observation; absent old producers cannot attest it.
+  SourceCheckpoint source_checkpoint = 22;
+}
+
+// ===== 日志（NODE-RPT-04/05/06） =====
+
+message LogRecord {
+  int64 ts_ms = 1;
+  // DEBUG/INFO/WARN/ERROR。
+  string level = 2;
+  // 稳定字面量；动态内容使用结构化字段。
+  string message = 3;
+  string pipeline_id = 4;
+  string module = 5;
+  map<string, string> fields = 6;
+}
+
+// LogBatch 批量压缩发布（NODE-RPT-04）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message LogBatch {
+  string node_id = 1;
+  repeated LogRecord records = 2;
+}
+
+// ===== 事件（需求 LOOP-04/LOOP-15） =====
+
+// EventKind 定义上报事件类型。节点离线由 Manager 根据心跳产生，
+// 其余事件由 Node 执行模块上报，使用统一展示和告警管线。
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_ERROR = 1;
+  EVENT_KIND_DDL = 2;
+  EVENT_KIND_CONFLICT = 3;
+  EVENT_KIND_UNKNOWN_ORIGIN = 4;
+  EVENT_KIND_BACKPRESSURE = 5;
+  EVENT_KIND_LOCAL_STORE_REBUILD = 6;
+  EVENT_KIND_LINK_PROBE_FAILED = 7;
+  EVENT_KIND_NODE_OFFLINE = 8;
+}
+
+// ErrorEventDetail 对应 event.error。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ErrorEventDetail {
+  string code = 1;
+  string detail = 2;
+  bool retryable = 3;
+}
+
+// DDLEventDetail 对应 event.ddl（NODE-BIN-04：DDL 到达时上报 Manager，不落业务库）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message DDLEventDetail {
+  // Set only for a confirmed structure migration step result.
+  SchemaMigrationStepResult migration = 10;
+  string schema = 1;
+  string statement = 2;
+  string gtid = 3;
+}
+
+// ConflictResolution 是冲突处理结果（LOOP-15"处理结果"列）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum ConflictResolution {
+  CONFLICT_RESOLUTION_UNSPECIFIED = 0;
+  CONFLICT_RESOLUTION_APPLIED = 1;
+  CONFLICT_RESOLUTION_DISCARDED = 2;
+  // 整事务判负回滚（LWW，LOOP-16：该 GTID 不进入目标库 gtid_executed，级联下游收不到）。
+  CONFLICT_RESOLUTION_TXN_ROLLED_BACK = 3;
+}
+
+// ConflictEventDetail 对应 event.conflict（LOOP-15：表、主键、冲突类型、处理结果、
+// 前后镜像，可配置脱敏）。复用 proto/data.proto 的 RowChange 表达"表、主键、变更类型、前后镜像"，
+// 原始 change/target_row 保持已有语义。配置 mask_rules 时，节点只发送新增
+// redacted_change/redacted_target_row：敏感值在离开目标节点前遮蔽，Manager
+// 及界面读取安全镜像，不保留可切换回原值的副本。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message ConflictEventDetail {
+  RowChange change = 1;
+  ConflictMode policy = 2;
+  ConflictResolution resolution = 3;
+  // Stable detection reason: insert_duplicate, update_missing, delete_missing,
+  // update_mismatch, delete_mismatch or lww_rejected. Required for every conflict report.
+  string reason = 4;
+  // Actual target row locked before applying the change, aligned to column_names.
+  Row target_row = 5;
+  string gtid = 6;
+  // When masking is enabled, these report-only images replace change and
+  // target_row. Selected column values are "***"; original images are absent.
+  // Original and redacted images must not appear together.
+  RowChange redacted_change = 7;
+  Row redacted_target_row = 8;
+}
+
+// UnknownOriginEventDetail 对应 event.unknown_origin（LOOP-04：未登记 UUID 默认视为源
+// 端点所在中心，同时上报本事件）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message UnknownOriginEventDetail {
+  string uuid = 1;
+  string assumed_center = 2;
+}
+
+// BackpressureEventDetail 对应 event 的背压种类。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message BackpressureEventDetail {
+  string module = 1;
+  string reason = 2;
+}
+
+// LocalStoreRebuildEventDetail 对应本地状态库自检重建（NODE-XDOC-06）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message LocalStoreRebuildEventDetail {
+  string reason = 1;
+  string backup_path = 2;
+}
+
+// LinkProbeFailedEventDetail 对应端到端链路探测失败（NODE-MQO-05）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message LinkProbeFailedEventDetail {
+  string probe_id = 1;
+  string detail = 2;
+}
+
+// Event 是全部事件种类共用的信封，用 oneof 携带具体细节；event_id 由节点生成（建议 UUID）
+// 作为 Manager 去重的幂等键。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message Event {
+  string event_id = 1;
+  EventKind kind = 2;
+  // 非 pipeline 级事件（如节点自身的 local_store_rebuild）可为空。
+  string pipeline_id = 3;
+  string node_id = 4;
+  int64 ts_ms = 5;
+  // INFO/WARN/ERROR，与日志级别体系一致。
+  string level = 6;
+  // 面向用户的稳定描述。
+  string message = 7;
+  oneof detail {
+    ErrorEventDetail error = 8;
+    DDLEventDetail ddl = 9;
+    ConflictEventDetail conflict = 10;
+    UnknownOriginEventDetail unknown_origin = 11;
+    BackpressureEventDetail backpressure = 12;
+    LocalStoreRebuildEventDetail local_store_rebuild = 13;
+    LinkProbeFailedEventDetail link_probe_failed = 14;
+  }
+}
+
+message SchemaMigrationStepResult {
+  uint64 run_id = 1;
+  string schema_uuid = 2;
+  uint64 seq = 3;
+  bool success = 4;
+  string error = 5;
+}

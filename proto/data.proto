@@ -1,0 +1,263 @@
+syntax = "proto3";
+
+package xdts.v1;
+
+option go_package = "github.com/xmapst/xdts/internal/iproto;iproto";
+
+import "config.proto";
+
+// 数据面包含增量批次（xdts.data / pl.<id>）与全量分块（xdts.data / pl.<id>.snap）。
+// ColumnValue 用 oneof 标识列值类型，NULL 显式编码为 is_null=true。
+// 时间值使用自 0001-01-01T00:00:00Z 起的微秒数；零值日期由 zero_date 单独标记。
+message ColumnValue {
+  oneof value {
+    // 恒为 true；NULL 值的显式表达。
+    bool is_null = 1;
+    int64 i64 = 2;
+    uint64 u64 = 3;
+    double f64 = 4;
+    string decimal = 5;
+    bytes raw_bytes = 6;
+    string text = 7;
+    int64 temporal_usec = 8;
+  }
+  // true 表示这是 MySQL 的"零值日期/时间"（如 '0000-00-00'），temporal_usec 无意义；
+  // 目标端写入时应还原为同样的零值字面量，而不是按 temporal_usec=0 写出公元1年。
+  bool zero_date = 9;
+}
+
+// Row 是一行的列值集合，按下标与所属 RowChange.column_names（或 SnapshotChunk.column_names）
+// 一一对应。Row 本身不重复携带列名，避免同一事务内大量行重复相同的字符串。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message Row {
+  repeated ColumnValue values = 1;
+}
+
+// UniqueKeyColumns 表达唯一键覆盖的列名，属于所属消息 column_names。
+// 全量和增量收敛写入需要完整主键与唯一键集合，以删除所有冲突行后写入。
+message UniqueKeyColumns {
+  repeated string columns = 1;
+}
+
+// ChangeType 标识一次行变更的类型。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+enum ChangeType {
+  CHANGE_TYPE_UNSPECIFIED = 0;
+  CHANGE_TYPE_INSERT = 1;
+  CHANGE_TYPE_UPDATE = 2;
+  CHANGE_TYPE_DELETE = 3;
+}
+
+message RowChange {
+  ChangeType type = 1;
+  string schema = 2;
+  string table = 3;
+  // 参与同步的列（已按列过滤规则裁剪、已剔除 STORED 生成列），before/after 的 values
+  // 按下标与此列表对应。
+  repeated string column_names = 4;
+  // column_names 的子集，标识主键列；无主键的表在预检查阶段即被阻断（NODE-OUT-04），
+  // 不会产生此消息。
+  repeated string primary_key_columns = 5;
+  // 源端提供与同步列投影一致的完整唯一键集合，目标端据此处理冲突。
+  repeated UniqueKeyColumns unique_keys = 6;
+  Row before = 7;
+  Row after = 8;
+}
+
+// DDL 表达一次结构变更事务（DDL 事务不与 DML 混合，DDL 与 DML 在聚合阶段分开）。
+// statement 是源端 Query 事件的原始文本；按目标端策略改写（映射、列过滤、DEFINER、
+// 触发器守卫等，NODE-SCH-04）发生在目标端 transform 阶段，不在这条消息里体现。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message DDL {
+  string schema = 1;
+  string statement = 2;
+  int64 commit_ts_ms = 3;
+  // 解析得到的受影响表，尽力而为，仅供路由/统计/界面展示使用，不作为执行依据
+  // （执行依据是 statement 本身与目标端的 AST 改写结果）。
+  repeated string affected_tables = 4;
+  // Source rules at this transaction's publication boundary. Raw statement
+  // remains the execution authority.
+  DDLColumnPolicy column_policy = 5;
+  // Complete source dependencies captured before applying this original DDL.
+  repeated DDLTableDependencies source_dependencies = 6;
+}
+
+message DDLTableDependencies {
+  string schema = 1;
+  string table = 2;
+  bool complete = 3;
+  repeated string columns = 4;
+  repeated DDLDependency objects = 5;
+  repeated string partition_columns = 6;
+}
+
+message DDLDependency {
+  string kind = 1;
+  string name = 2;
+  repeated string columns = 3;
+  bool expression = 4;
+}
+
+message DDLColumnPolicy {
+  repeated ColumnFilterRule rules = 1;
+  bool source_case_sensitive = 2;
+}
+
+// Chunk 标识一个大事务被顺序切分后的分片位置（NODE-BIN-03/NODE-MQO-01"大事务分片"）。
+// 只在 DataBatch.chunk 被设置时才有意义；此时 DataBatch.txns 必须恰好包含一个 Txn
+// （被分片的那一个，携带该事务本次分片的 RowChange 子集），重组键为
+// (pipeline_id, run_id, epoch, txn.gtid, chunk.index)，由目标端 amqp_in 按
+// (gtid, chunk_index) 重组。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message Chunk {
+  uint32 index = 1;
+  uint32 total = 2;
+}
+
+// Txn 是一个完整源事务（或其一个分片）的载体，包含事务身份和行变更。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message Txn {
+  string gtid = 1;
+  // 来源中心（回环识别用），由源端 binlog_in 依据来源映射解出。
+  string origin_center = 2;
+  // 消息层血缘：事务经过的中心列表，用于回环兜底判定（LOOP-06）。
+  repeated string path = 3;
+  uint32 hops = 4;
+  int64 commit_ts_ms = 5;
+  int64 last_committed = 6;
+  int64 sequence_number = 7;
+  // DDL 事务时为空；DML 事务时非空。两者互斥。
+  repeated RowChange rows = 8;
+  DDL ddl = 9;
+  // Visited physical database server_uuid values. Same-center transfers use
+  // this path in addition to the center path.
+  repeated string endpoint_path = 10;
+  // Immutable source tool rules at this transaction's publication boundary.
+  // Physical row and DDL names are preserved until target mapping.
+  ShadowTablePolicy shadow_table_policy = 11;
+  // 0 means explicitly incomplete known history. 1 proves complete v1 physical
+  // lineage, including native roots and durable imported records.
+  // A nonempty endpoint_path alone never proves that no XDTS visit was omitted.
+  // Version 1 starts at a probed native source or a configured synthetic run;
+  // it covers subsequent XDTS visits, not unobserved native MySQL replica hops.
+  uint32 lineage_version = 12;
+}
+
+message ShadowTablePolicy {
+  repeated ShadowTableRule rules = 1;
+  bool source_case_sensitive = 2;
+}
+
+// DataBatch 是增量数据面消息，routing key: pl.<pipeline_id>。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message DataBatch {
+  string pipeline_id = 1;
+  uint64 run_id = 2;
+  // 源端每次启动/改位点递增，先落盘再使用，用于目标端丢失检测（NODE-MQI-02）。
+  uint64 epoch = 3;
+  // epoch 内连续递增，重复直接丢弃、跳号立即停机告警（NODE-MQI-02）。
+  uint64 batch_seq = 4;
+  string begin_gtid_set = 5;
+  string end_gtid_set = 6;
+  repeated Txn txns = 7;
+  // 非空时表示本批次是某个大事务的一个分片，见 Chunk 的注释。
+  Chunk chunk = 8;
+  // A stable first sequence for one publication-window generation.
+  uint64 publication_window_first_seq = 9;
+  // Immutable publication-time policy, also valid after a runtime policy change.
+  IncrementalWindowPolicy publication_window_policy = 10;
+}
+
+// SnapshotChunk 是全量数据面消息，routing key: pl.<pipeline_id>.snap。
+// 目标端写入时 gtid_next = <全量合成UUID>:<chunk_no>。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SnapshotChunk {
+  string pipeline_id = 1;
+  uint64 run_id = 2;
+  // 全局单调、不复用；目标端按 <合成UUID>:<chunk_no> 去重（NODE-SNAP-17）。
+  uint64 chunk_no = 3;
+  // Original L-after CREATE transaction, durably captured before these rows.
+  // Target commits its native GTID before applying the synthetic chunk GTID.
+  Txn table_creation = 11;
+  string schema = 4;
+  string table = 5;
+  // Same source rule boundary as the rows in this chunk.
+  ShadowTablePolicy shadow_table_policy = 10;
+  // 与 RowChange.column_names 同规则：已排除 STORED 生成列，rows 中每个 Row.values
+  // 按下标对应本列表。
+  repeated string column_names = 6;
+  // column_names 的子集，标识主键列（无主键时分块改用非空唯一键，见
+  // NODE-SNAP-02）；主键与唯一键两者都没有的表不支持全量，预检查阶段即被
+  // 阻断，不会产生此消息。
+  repeated string primary_key_columns = 7;
+  // 与 column_names 对齐的完整唯一键集合，用于目标端收敛写入。
+  repeated UniqueKeyColumns unique_keys = 8;
+  repeated Row rows = 9;
+  // Present only for negotiated single-table recovery; chunk_no belongs to
+  // this independent recovery UUID, never to the original snapshot UUID.
+  SnapshotRecoveryIdentity recovery = 12;
+}
+
+// SnapshotEnd 标记全量分块规划的终点：低水位 L（分块规划前读取）与高水位 H
+// （最后一个分块读取完成后读取），供目标端核对分块总数并从 L 起以收敛模式重放增量
+// 直至覆盖 H。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message SnapshotEnd {
+  string pipeline_id = 1;
+  uint64 run_id = 2;
+  string low_gtid_set = 3;
+  string high_gtid_set = 4;
+  uint64 total_chunks = 5;
+  // Present together only for a negotiated append-only plan. total_chunks
+  // remains the final confirmed GTID prefix, immutable after End.
+  uint64 initial_total_chunks = 6;
+  uint64 plan_extension_sequence = 7;
+  SnapshotRecoveryIdentity recovery = 8;
+  repeated SnapshotRecoveryTable recovery_tables = 9;
+}
+
+message SnapshotRecoveryTable {
+  string schema = 1;
+  string table = 2;
+}
+
+message SnapshotRecoveryIdentity {
+  uint64 sequence = 1;
+  string uuid = 2;
+}
+
+// Ordered on the snapshot route before any recovery chunk. The target first
+// consumes incrementals through low_gtid_set, commits deferred whole original
+// transactions, then opens the independent cleanup/snapshot generation.
+message SnapshotRecoveryBegin {
+  string pipeline_id = 1;
+  uint64 run_id = 2;
+  SnapshotRecoveryIdentity recovery = 3;
+  string low_gtid_set = 4;
+  repeated SnapshotRecoveryTable tables = 5;
+}
+
+// Watermark 是源库空闲期间的水位消息（NODE-BIN-07），保证目标端能持续计算端到端延迟并
+// 感知源端存活，即使没有新事务产生。与 DataBatch 共用同一路由（pl.<pipeline_id>）。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message Watermark {
+  string pipeline_id = 1;
+  string gtid_set = 2;
+  int64 source_ts_ms = 3;
+  // Identifies the initialization run.
+  uint64 run_id = 4;
+}
+
+// Probe 是数据面端到端链路探测消息（NODE-MQO-05）：部署时源节点在目标节点完成队列声明
+// 与绑定后，向实际数据队列发布本消息。停止阶段目标一次性消费者校验本次身份与签名，
+// 经控制面回执 Manager（ProbeResult LINK）；运行消费者仅清理残留，不产生启动授权。
+// 协议演进：只增字段，不复用/更改已分配的字段号，不改变已有字段语义。
+message Probe {
+  string pipeline_id = 1;
+  string probe_id = 2;
+  uint64 run_id = 3;
+  uint64 config_version = 4;
+  bool snapshot = 5;
+  string source_node_id = 6;
+  string source_center = 7;
+}

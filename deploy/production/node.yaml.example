@@ -1,0 +1,36 @@
+# xdts Node 生产配置示例。
+# 配置优先级：本文件 < XDTS_* 环境变量 < 命令行参数。
+# node.register_code 同时用于首次注册和本地 xdoc 状态库，必须通过密钥注入。
+
+amqp:
+  # 填写 Node 所属管理中心的 RabbitMQ vhost。
+  url: "amqps://xdts_node:change-me@rabbitmq.example.com:5671/xdts"
+
+node:
+  # 目录必须持久化；其中包含 identity.xdoc、state.xdoc、backup/ 和 corrupt/。
+  data_dir: "/var/lib/xdts-node"
+  register_code: "change-me-register-code"
+
+store:
+  batch_interval: 100ms
+  batch_max_ops: 200
+  # 关闭时排空在途异步任务并提交最后一批状态。
+  shutdown_timeout: 30s
+
+controller:
+  # 控制队列 handler 的关闭等待上限；必须为正数。
+  shutdown_timeout: 5s
+
+resources:
+  max_pipelines: 100
+  max_buffer_bytes: 1073741824
+  pipeline_buffer_bytes: 134217728
+  snapshot_concurrency: 8
+
+log:
+  format: json
+  level: info
+  file: ""
+  max_size_mb: 50
+  max_backups: 7
+  max_age_days: 7

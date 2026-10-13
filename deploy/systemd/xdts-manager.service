@@ -1,0 +1,24 @@
+[Unit]
+Description=xdts Manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=xdts
+Group=xdts
+WorkingDirectory=/etc/xdts
+EnvironmentFile=-/etc/xdts/manager.env
+ExecStart=/usr/local/lib/xdts/xdts-manager --config /etc/xdts/manager.yaml
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/xdts
+
+[Install]
+WantedBy=multi-user.target
